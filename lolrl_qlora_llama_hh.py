@@ -26,6 +26,7 @@ from utils.utils import RANDOM_SEED, save_in_pickle, load_from_pickle, make_dir_
 import random
 
 from utils.rl_utils import ValueHeadMLP, ValueHeadAttention, numba_choice
+import wandb
 
 # Define and parse arguments.
 @dataclass
@@ -58,7 +59,7 @@ class ScriptArguments:
     # ['adamw_hf', 'adamw_torch', 'adamw_torch_fused', 'adamw_torch_xla', 'adamw_apex_fused', 'adafactor', 'adamw_bnb_8bit', 'adamw_anyprecision', 'sgd', 'adagrad']
     # Somebody suggested using adamw_bnb_8bit: https://gist.github.com/pacman100/1731b41f7a90a87b457e8c5415ff1c14?permalink_comment_id=4610607#gistcomment-4610607
 
-    per_device_eval_batch_size: Optional[int] = field(default=16, metadata={"help": "eval batch size per device"})
+    per_device_eval_batch_size: Optional[int] = field(default=4, metadata={"help": "eval batch size per device"})
 
     double_quant: bool = field(default=True, metadata={"help": "Compress the quantization statistics through double quantization."})
     quant_type: str = field(default="nf4", metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."})
@@ -74,7 +75,7 @@ class ScriptArguments:
     save_steps: Optional[int] = field(default=2500, metadata={"help": "the saving frequency"})
     # max_steps: Optional[int] = field(default=10000, metadata={"help": "max number of training steps"})
     max_steps: Optional[int] = field(default=9000, metadata={"help": "max number of training steps"})
-    eval_steps: Optional[int] = field(default=900, metadata={"help": "the evaluation frequency"})
+    eval_steps: Optional[int] = field(default=200, metadata={"help": "the evaluation frequency"})
 
     output_dir: Optional[str] = field(default="./results", metadata={"help": "the output directory"})
     log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
@@ -84,11 +85,22 @@ class ScriptArguments:
     report_to: Optional[str] = field(
         default="wandb",
         metadata={
-            "help": 'The list of integrations to report the results and logs to. Supported platforms are `"azure_ml"`,'
-            '`"comet_ml"`, `"mlflow"`, `"neptune"`, `"tensorboard"`,`"clearml"` and `"wandb"`. '
-            'Use `"all"` to report to all integrations installed, `"none"` for no integrations.'
+            "help": 'The list of integrations to report the results and logs to. Supported platforms are `"wandb"`.'
         },
     )
+    project_name: Optional[str] = field(
+        default="alepo-lol",
+        metadata={
+            "help": 'wandb project.'
+        },
+    )
+    entity: Optional[str] = field(
+        default="alelab",
+        metadata={
+            "help": 'wandb entity.'
+        },
+    )
+
     # debug argument for distributed training
     ignore_bias_buffers: Optional[bool] = field(
         default=False,
@@ -107,13 +119,90 @@ class ScriptArguments:
     # Extra args for LoLRL
     # a2c_n_value_head_epochs: Optional[int] = field(default=5, metadata={"help": "the number of epochs to train the value head for"})
     a2c_n_value_head_epochs: Optional[int] = field(default=10, metadata={"help": "the number of epochs to train the value head for"})
-    algorithm: Optional[str] = field(default="nll", metadata={"help": "the algorithm to use for training choices=['nll', 'wbc', 'r_gold', 'r_lol', 'a_lol', 'a_lol_ref_free', 'a_lol_seq', 'a_lol_kl']"})
-    ppo_clip: Optional[float] = field(default=0.9, metadata={"help": "the clipping parameter for PPO"})
-    kl_beta: Optional[float] = field(default=0.0, metadata={"help": "the beta parameter for KL penalty"})
+    algorithm: Optional[str] = field(default="ofopo", metadata={"help": "the algorithm to use for training choices=['nll', 'wbc', 'r_gold', 'r_lol', 'a_lol', 'a_lol_ref_free', 'a_lol_seq', 'a_lol_kl']"})
+    ppo_clip: Optional[float] = field(default=None, metadata={"help": "the clipping parameter for PPO"})
+    kl_beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for KL penalty"})
     sampling_strategy: Optional[str] = field(default=None, metadata={"help": "the sampling strategy to use for advantage LoL RL methods"})
+    ofopo_dispreferred_ratio: Optional[float] = field(default=0.5, metadata={"help": "the ratio of dispreferred responses to sample"})
+    ofopo_reward_sigmoid: Optional[bool] = field(default=False, metadata={"help": "whether to apply a sigmoid to the reward"})
     cache_dir: Optional[str] = field(default="cache/", metadata={"help": "the cache directory"})
     seed: Optional[int] = field(default=RANDOM_SEED, metadata={"help": "the random seed"})
+######
+# (ihounie): pre computing the baseline full sequence log probs to speedup
+# and save some memory
+######
+def get_or_compute_log_probs(baseline_model, tokenizer, dataset, batch_size, device, cache_dir):
+    # Define the file path for storing log probabilities
+    log_probs_file = os.path.join(cache_dir, "log_probs_cache.pkl")
+    
+    # Check if log probabilities have already been computed and saved
+    if os.path.exists(log_probs_file):
+        logging.info(f"Loading precomputed log probabilities from {log_probs_file}")
+        log_probs = load_from_pickle(log_probs_file)
+        logging.info(f"Loaded precomputed log probabilities from disk")
+    else:
+        logging.info(f"Precomputed log probabilities not found. Computing log probabilities...")
+        log_probs = precompute_and_save_baseline_log_probs(baseline_model, tokenizer, dataset, batch_size, device, log_probs_file)
+        logging.info(f"Computed and saved log probabilities in {log_probs_file}")
 
+    return log_probs
+
+def precompute_and_save_baseline_log_probs(baseline_model, tokenizer, dataset, batch_size, device, baseline_log_probs_file):
+    baseline_full_seq_log_probs_list = []
+    baseline_model.eval()
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(dataset), batch_size), desc="Precomputing baseline full sequence log probs"):
+            end_index = min(i + batch_size, len(dataset))
+            batch = [dataset[j] for j in range(i, end_index)]
+            batch_og_prefixes = [datum['prefix'][0] for datum in batch]
+            batch_prefixes = ["".join(prefix) for prefix in batch_og_prefixes]
+            prompt_prefix = "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+            batch_prefixes_fixed = [prompt_prefix + prefix_str.replace("<|prompter|>", " ### Human: ").replace("<|assistant|>", " ### Assistant: ").strip() for prefix_str in batch_prefixes]
+            # 2.2 Get left truncated prefix input
+            tokenizer.truncation_side, tokenizer.padding_side = "left", "left"
+            current_batch_prefixes_inputs = tokenizer(batch_prefixes_fixed, max_length = 768 - 128,truncation = True,add_special_tokens=True, padding = True, return_tensors="pt").to(baseline_model.device)
+            batch_size, query_seq_len = current_batch_prefixes_inputs["input_ids"].shape
+            baseline_full_seq_log_probs_suffix_list = []
+            for suffix_index in [0, 1]:
+                batch_suffix_indices = [suffix_index] * len(batch)
+                # 2. Preprocess the batch data for model
+                # 2.1. Get the batch prefix and suffix
+            
+                batch_suffixes = [datum['suffix'][batch_suffix_indices[i]] for i, datum in enumerate(batch)]
+                
+                # 2.3 Get right truncated suffix input
+                # NOTE: Adding tokenizer_eos token to the end of the suffixes
+                batch_suffixes = [suffix + tokenizer.eos_token for suffix in batch_suffixes]
+                tokenizer.truncation_side, tokenizer.padding_side = "right", "right"
+                current_batch_suffixes_inputs = tokenizer(batch_suffixes, max_length = 128,truncation = True,add_special_tokens=False, padding = True, return_tensors="pt").to(baseline_model.device)
+                # Gather per label logits
+                labels = current_batch_suffixes_inputs["input_ids"]
+                response_mask = current_batch_suffixes_inputs["attention_mask"]
+                baseline_input_ids = torch.cat([current_batch_prefixes_inputs["input_ids"], current_batch_suffixes_inputs["input_ids"]], dim=1).to(baseline_model.device)
+                baseline_attention_mask = torch.cat([current_batch_prefixes_inputs["attention_mask"], current_batch_suffixes_inputs["attention_mask"]], dim=1).to(baseline_model.device)
+                baseline_outputs = baseline_model(baseline_input_ids, attention_mask=baseline_attention_mask)
+                batch_size, query_seq_len = current_batch_prefixes_inputs["input_ids"].shape
+                baseline_resp_logits = baseline_outputs.logits[:, (query_seq_len - 1):-1, :]
+                baseline_log_probs = F.log_softmax(baseline_resp_logits, dim=-1)
+                baseline_labels = labels.to(baseline_model.device)
+                baseline_per_token_log_probs = -torch.gather(baseline_log_probs, 2, baseline_labels[:, :, None]).squeeze(2)
+                baseline_response_mask = response_mask.to(baseline_model.device)
+                baseline_full_seq_log_probs = torch.sum(baseline_per_token_log_probs * baseline_response_mask, dim=1)
+            
+                #print(f"baseline_full_seq_log_probs shape = {baseline_full_seq_log_probs.shape}")
+                # Convert to CPU and numpy for storage
+                baseline_full_seq_log_probs_np = baseline_full_seq_log_probs.cpu().numpy()
+                baseline_full_seq_log_probs_suffix_list.append(baseline_full_seq_log_probs_np[:, None])
+            baseline_full_seq_log_probs_np = np.hstack(baseline_full_seq_log_probs_suffix_list)
+            # Append to list
+            baseline_full_seq_log_probs_list.extend(baseline_full_seq_log_probs_np)
+    baseline_full_seq_log_probs_array = np.vstack(baseline_full_seq_log_probs_list)
+    # Save the full sequence log probabilities to a file
+    save_in_pickle(baseline_full_seq_log_probs_array, baseline_log_probs_file)
+    logging.info(f"Saved baseline full sequence log probabilities in {baseline_log_probs_file}")
+    
+    return baseline_full_seq_log_probs_array
 def evaluate_on_validation(args, model, tokenizer, get_score, reward_batch_size):
     model.eval()
     
@@ -215,7 +304,8 @@ def train_value_function_on_val_predictions(value_function_model, model, tokeniz
             current_batch_suffixes = [suffixes[id_] for id_ in batch]
             current_batch_rewards = [all_gen_rewards[id_] for id_ in batch]
             # Create prompt inputs for the model
-            current_batch_prefixes_inputs = tokenizer(current_batch_prefixes, max_length = 768 - 128,truncation = True,add_special_tokens=True, padding = True, return_tensors="pt").to(model.device)
+            current_batch_prefixes_inputs = tokenizer(current_batch_prefixes, max_length = 768 - 128, truncation = True,
+                                                       add_special_tokens=True, padding = True, return_tensors="pt").to(model.device)
             input_ids = current_batch_prefixes_inputs["input_ids"]
             attention_mask = current_batch_prefixes_inputs["attention_mask"]
             with torch.no_grad(): outputs = model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -355,6 +445,10 @@ if __name__ == "__main__":
     torch.cuda.manual_seed_all(script_args.seed)
     logging.info(f"Set all seeds to {script_args.seed}")
 
+    # Initialize W&B run
+    if script_args.report_to == "wandb":
+        wandb.init(project=script_args.project_name, entity=script_args.entity, config=vars(script_args))
+
     # Create the cache dir
     make_dir_if_not_exists(script_args.cache_dir)
     # logging.info(f"Loading model from {script_args.model_name_or_path}")
@@ -386,62 +480,6 @@ if __name__ == "__main__":
         logging.info(f"GPU{id}: Total memory: {info.total} Free memory: {info.free} Used memory: {info.used}")
     # device = torch.device("cuda:0")
     # baseline_device = torch.device("cuda:1")
-    start_time = time()
-    print_gpu_info(handle0, 0)
-    print_gpu_info(handle1, 1)
-    logging.info(f"Loading model from {script_args.model_name_or_path}")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        script_args.model_name_or_path,
-        load_in_4bit=True,
-        # torch_dtype=torch.bfloat16,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        # max_memory= {i: '40000MB' for i in range(torch.cuda.device_count())},
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            # bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_compute_dtype=torch.float16,
-            # bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type='nf4'
-        ),
-    )
-    print_gpu_info(handle0, 0)
-    print_gpu_info(handle1, 1)
-    logging.info(f"Loading adapter model from {script_args.adapter_path}")
-    model = PeftModel.from_pretrained(base_model, script_args.adapter_path, is_trainable=True)
-    logging.info(f"Loaded the model in {time() - start_time} seconds")
-    model.train()
-    print_trainable_parameters(model)
-    
-    if script_args.algorithm in ["r_lol", "a_lol", "a_lol_seq"]:
-        print_gpu_info(handle0, 0)
-        print_gpu_info(handle1, 1)
-        # Sharing backbone between training and behavior policy is not permitted yet: https://github.com/huggingface/peft/issues/854
-        logging.info(f"Loading another base model from {script_args.model_name_or_path}")
-        baseline_base_model = AutoModelForCausalLM.from_pretrained(
-            script_args.model_name_or_path,
-            load_in_4bit=True,
-            torch_dtype=torch.float16,
-            # torch_dtype=torch.bfloat16,
-            device_map="auto",
-            # max_memory= {i: '40000MB' for i in range(torch.cuda.device_count())},
-            quantization_config=BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float16,
-                # bnb_4bit_compute_dtype=torch.bfloat16,
-                # bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type='nf4'
-            ),
-        )
-        print_gpu_info(handle0, 0)
-        print_gpu_info(handle1, 1)
-        # Also initialize a behavior policy model
-        logging.info(f"Initializing the behavior policy model from {script_args.adapter_path}")
-        baseline_model = PeftModel.from_pretrained(baseline_base_model, script_args.adapter_path, is_trainable=False)
-        baseline_model.eval()
-        print_trainable_parameters(baseline_model)
-        print_gpu_info(handle0, 0)
-        print_gpu_info(handle1, 1)
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(script_args.model_name_or_path, use_fast=False)
@@ -465,6 +503,8 @@ if __name__ == "__main__":
     logging.info(f"Loading train dataset from {script_args.train_file_path}")
     # train_dataset = load_dataset("json", data_dir = script_args.train_file_path, data_files = "train.json", streaming=False, split="train")
     train_dataset = load_dataset("json", data_dir = script_args.train_file_path, data_files = "cleaner_train.json", streaming=False, split="train")
+    #(ihounie): uncomment for debugging
+    #train_dataset = train_dataset.select([i for i in range(128)])
     logging.info(f"Loaded train dataset with {len(train_dataset)} samples")
     all_good_suffixes = [datum[0] for datum in train_dataset['suffix']]
     all_good_suffixes_with_colon_end = [suffix for suffix in all_good_suffixes if suffix.endswith(":")]
@@ -473,6 +513,71 @@ if __name__ == "__main__":
     logging.info(f"Number of good suffixes with colon: {len(all_good_suffixes_with_colon)}")
     all_good_suffixes_with_newline = [suffix for suffix in all_good_suffixes if "\n" in suffix]
     logging.info(f"Number of good suffixes with newline: {len(all_good_suffixes_with_newline)}")
+
+    if script_args.algorithm in ["r_lol", "a_lol", "a_lol_seq", "ofopo"]:
+        print_gpu_info(handle0, 0)
+        print_gpu_info(handle1, 1)
+        # Sharing backbone between training and behavior policy is not permitted yet: https://github.com/huggingface/peft/issues/854
+        logging.info(f"Loading another base model from {script_args.model_name_or_path}")
+        baseline_base_model = AutoModelForCausalLM.from_pretrained(
+            script_args.model_name_or_path,
+            torch_dtype=torch.float16,
+            # torch_dtype=torch.bfloat16,
+            device_map="auto",
+            # max_memory= {i: '40000MB' for i in range(torch.cuda.device_count())},
+            quantization_config=BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                # bnb_4bit_compute_dtype=torch.bfloat16,
+                # bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+            ),
+        )
+        print_gpu_info(handle0, 0)
+        print_gpu_info(handle1, 1)
+        # Also initialize a behavior policy model
+        logging.info(f"Initializing the behavior policy model from {script_args.adapter_path}")
+        baseline_model = PeftModel.from_pretrained(baseline_base_model, script_args.adapter_path, is_trainable=False)
+        baseline_model.eval()
+        print_trainable_parameters(baseline_model)
+        print_gpu_info(handle0, 0)
+        print_gpu_info(handle1, 1)
+        # Get or compute log probabilities
+        baseline_log_probs = get_or_compute_log_probs(
+            baseline_model,
+            tokenizer,
+            train_dataset,
+            script_args.per_device_eval_batch_size,
+            baseline_model.device,
+            script_args.cache_dir
+        )
+        del baseline_model
+        del baseline_base_model
+        start_time = time()
+    print_gpu_info(handle0, 0)
+    print_gpu_info(handle1, 1)
+    logging.info(f"Loading model from {script_args.model_name_or_path}")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        script_args.model_name_or_path,
+        # torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        # max_memory= {i: '40000MB' for i in range(torch.cuda.device_count())},
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            # bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_compute_dtype=torch.float16,
+            # bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type='nf4'
+        ),
+    )
+    print_gpu_info(handle0, 0)
+    print_gpu_info(handle1, 1)
+    logging.info(f"Loading adapter model from {script_args.adapter_path}")
+    model = PeftModel.from_pretrained(base_model, script_args.adapter_path, is_trainable=True)
+    logging.info(f"Loaded the model in {time() - start_time} seconds")
+    model.train()
+    print_trainable_parameters(model)
 
     # Perform an initial validation
     eval_cache_file = os.path.join(script_args.cache_dir, "eval_cache.pkl")
@@ -535,14 +640,20 @@ if __name__ == "__main__":
         all_values = np.array(all_values)
         all_good_advantages = np.array(all_good_advantages)
         all_bad_advantages = np.array(all_bad_advantages)
-
+ 
     all_good_rewards = torch.sigmoid(torch.tensor([datum[0] for datum in train_dataset['reward']])).cpu().detach().numpy()
     all_bad_rewards = torch.sigmoid(torch.tensor([datum[1] for datum in train_dataset['reward']])).cpu().detach().numpy()
+    # (ihounie): I have changed this to sample from y+ and y- in the same batch
+    all_rewards = np.array([datum for datum in train_dataset['reward']])
+    # (ihounie): I have made the sigmoid transformation optional, i.e. optimizing the raw reward coming
+    # from the model. Note that rewards need not be in the [0,1] range if script_args.ofopo_reward_sigmoid is False (by default).
+    if script_args.ofopo_reward_sigmoid:
+        all_rewards = 1/(1+np.exp(-all_rewards))
     # Train the model with a_lol
 
 
     # 2. Start custom training loop
-    if script_args.algorithm == "nll":
+    if script_args.algorithm in ["nll", "ofopo"]:
         logging.info(f"Shuffling the train indices.")
         train_indices = list(range(len(train_dataset)))
         current_train_indices = deepcopy(train_indices)
@@ -649,7 +760,7 @@ if __name__ == "__main__":
     total_suffix_distribution = {0:0, 1:0}
     logging.info(f"Evaluating every {script_args.eval_steps * script_args.gradient_accumulation_steps} steps.")
     logging.info(f"Using algorithm: {script_args.algorithm}")
-    if script_args.algorithm in ["a_lol", "a_lol_seq", "a_lol_ref_free"]:
+    if script_args.algorithm in ["a_lol", "a_lol_seq", "a_lol_ref_free", "ofopo"]:
         logging.info(f"Using PPO CLIP: {script_args.ppo_clip}")
         logging.info(f"Using KL beta: {script_args.kl_beta}")
     best_model = None
@@ -665,12 +776,26 @@ if __name__ == "__main__":
                 sampler = iter(current_train_indices)
                 batch_indices = [next(sampler) for _ in range(script_args.per_device_train_batch_size)]
             batch_suffix_indices = [0] * len(batch_indices)
+        elif script_args.algorithm == "ofopo":
+            try:
+                batch_indices = [next(sampler) for _ in range(script_args.per_device_train_batch_size)]
+            except StopIteration:
+                logging.info(f"Shuffling the train indices.")
+                current_train_indices = deepcopy(train_indices)
+                random.shuffle(current_train_indices)
+                sampler = iter(current_train_indices)
+                batch_indices = [next(sampler) for _ in range(script_args.per_device_train_batch_size)]
+            # Sampling a fixed ratio of dispreferred responses
+            dispreferred_indexes = np.random.choice(np.arange(len(batch_indices)), int(len(batch_indices) * script_args.ofopo_dispreferred_ratio), replace=False)
+            batch_suffix_indices = np.zeros(len(batch_indices), dtype=np.int8)
+            batch_suffix_indices[dispreferred_indexes] = 1
+            batch_rewards = all_rewards[batch_indices, batch_suffix_indices]
+            batch_bline_log_probs = baseline_log_probs[batch_indices, batch_suffix_indices]
+            
         elif script_args.algorithm in ["wbc", "r_gold", "r_lol"]:
             batch_indices = numba_choice(sample_indices, sample_probs_csum, 4).tolist()
             if script_args.sampling_strategy == "good_priority":
                 batch_rewards = all_good_rewards[batch_indices]
-                # batch_values = all_values[batch_indices]
-                # batch_advantages = all_good_advantages[batch_indices]
                 batch_suffix_indices = [0] * len(batch_indices)
             else:
                 logging.warning(f"Not implemented for sampling strategy {script_args.sampling_strategy}")
@@ -815,32 +940,65 @@ if __name__ == "__main__":
                     importance_sampling_ratio = importance_sampling_ratio_clamped
             total_reward += np.mean(batch_rewards)
             postfix_dict["avg_reward"] = total_reward / (step+1)
+        elif script_args.algorithm in ["ofopo"]:
+            # Reward * Importance weight * log pi
+            batch_bline_neg_log_probs_tensor = torch.tensor(batch_bline_log_probs).to(model.device)
+                # Compute the seq importance sampling ratio over each word
+                # Both per_token_log_probs and baseline_per_token_log_probs are negative log probs
+            # (ihounie): I've moved (only) the importance sampling ratio outside of the no grad block
+            # because we want to backpropagate through pi and not through the baseline
+            per_seq_neg_log_probs = torch.sum(per_token_log_probs * response_mask, dim=1)
+            if script_args.report_to == "wandb":
+                wandb.log({"nll/train/batch":per_seq_neg_log_probs.mean().cpu().detach().item()}, step=step+1)
+            importance_sampling_ratio = torch.exp(batch_bline_neg_log_probs_tensor - per_seq_neg_log_probs)
+            if script_args.report_to == "wandb":
+                wandb.log({"importance_sampling_ratio/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
+            if script_args.ppo_clip is not None and script_args.ppo_clip > 0.0:
+                # Clamp the importance sampling ratio
+                importance_sampling_ratio_clamped = torch.clamp(importance_sampling_ratio, 1 - script_args.ppo_clip, 1 + script_args.ppo_clip)
+                # return_dict['importance_sampling_ratio_clamped'] = importance_sampling_ratio_clamped
+                importance_sampling_ratio = importance_sampling_ratio_clamped
+                if script_args.report_to == "wandb":
+                    wandb.log({"importance_sampling_ratio_clamped/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
+            #(ihounie) Just for logging
+            total_reward += np.mean(batch_rewards*importance_sampling_ratio.cpu().detach().numpy())
+            postfix_dict["IS_weighted_reward/train/avg"] = total_reward / (step+1)
             if script_args.kl_beta > 0.0:
-                assert script_args.ppo_clip == 0.0, breakpoint()
                 # per_token_log_probs is negative log probs
+                ###################
+                # (ihounie): THIS IS OUR LOSS
+                #####################
                 # baseline_full_seq_log_probs is negative log probs
                 per_seq_neg_log_probs = torch.sum(per_token_log_probs * response_mask, dim=1)
-                kl_penalty = script_args.kl_beta * (baseline_full_seq_log_probs - per_seq_neg_log_probs).mean()
-                total_kl_penalty += kl_penalty.cpu().detach().item()
-                postfix_dict["avg_kl_penalty"] = total_kl_penalty / (step+1)
-                # Multiply the per_token_log_probs with the reward
-                rlol_loss = torch.mean(per_seq_neg_log_probs * torch.FloatTensor(batch_rewards).to(model.device))
-                total_rlol_loss += rlol_loss.cpu().detach().item()
-                postfix_dict["avg_rlol_loss"] = total_rlol_loss / (step+1)
-                loss = rlol_loss + kl_penalty
+                # (ihounie): bear in mind that batch_bline_neg_log_probs_tensor and baseline_full_seq_log_probs are negative log probs
+                # so the line below is equivalent to 
+                # kl_penalty = - script_args.kl_beta * log(per_seq_probs/baseline_seq_probs).mean()
+                kl_penalty = script_args.kl_beta * ((per_seq_neg_log_probs-batch_bline_neg_log_probs_tensor))
+                total_kl_penalty += kl_penalty.mean().cpu().detach().item()
+                r_loss = torch.FloatTensor(batch_rewards).to(model.device)
+                total_rlol_loss += r_loss.mean().cpu().detach().item()
+                loss = -((r_loss + kl_penalty) * importance_sampling_ratio).mean()
+                breakpoint()
+                ###################
+                # (ihounie): THAT's IT. SIMPLE, RIGHT?
+                #####################
+                if script_args.report_to == "wandb":
+                    wandb.log({"kl_penalty/train/batch":kl_penalty.mean().cpu().detach().item()}, step=step+1)
+                    wandb.log({"reward/train/batch":r_loss.mean().cpu().detach().item()}, step=step+1)
+                    wandb.log({"reward_IS/train/batch":(r_loss*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
+                    wandb.log({"kl_penalty_IS/train/batch":(kl_penalty*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
+                    wandb.log({"loss_wo_IS/train/batch":(r_loss + kl_penalty).mean().cpu().detach().item()}, step=step+1)
+                    wandb.log({"loss/train/batch":(-loss).cpu().detach().item()}, step=step+1)
+                postfix_dict["kl_penalty/train/avg"] = total_kl_penalty / (step+1)
+                postfix_dict["reward/train/avg"] = total_rlol_loss / (step+1)
             else:
-                # Multiply importance sampling with log probs
-                importance_sampling_ratio = importance_sampling_ratio.to(model.device)
-                per_response_loss_with_importance_sampling = torch.sum(per_token_log_probs * response_mask, dim=1) * importance_sampling_ratio
-                total_per_resp_loss_with_IS += np.mean(per_response_loss_with_importance_sampling.cpu().detach().numpy())
-                postfix_dict["avg_loss_/w_IS"] = total_per_resp_loss_with_IS / (step+1)
-                # Get the rewards from extra args
-                # extra_data is a dict with dict_keys(['texts', 'responses', 'batch', 'rewards'])
-                # Convert list of rewards from extra_data['rewards'] to tensor
-                # rewards = torch.tensor(batch_rewards).to(model.device)
-
+                r_loss = torch.mean(torch.FloatTensor(batch_rewards).to(model.device)*importance_sampling_ratio)
+                total_rlol_loss += r_loss.cpu().detach().item()
+                postfix_dict["avg_r_loss"] = - total_rlol_loss / (step+1)
+                if script_args.report_to == "wandb":
+                    wandb.log({"reward/train/batch":r_loss.cpu().detach().item()}, step=step+1)
                 # Multiply the loss with the reward
-                loss = torch.mean(per_response_loss_with_importance_sampling * torch.FloatTensor(batch_rewards).to(model.device))
+                loss = r_loss
         elif script_args.algorithm in ["a_lol"]:
             # Calculate baseline policy value
             with torch.no_grad():
@@ -878,7 +1036,7 @@ if __name__ == "__main__":
             total_advantage += torch.mean(advantage).cpu().detach().item()
             postfix_dict["avg_advantage"] = total_advantage / (step+1)
             if script_args.kl_beta > 0.0:
-                assert script_args.ppo_clip == 0.0, breakpoint()
+                assert script_args.ppo_clip is None, breakpoint()
                 # per_token_log_probs is negative log probs
                 # baseline_full_seq_log_probs is negative log probs
                 per_seq_neg_log_probs = torch.sum(per_token_log_probs * response_mask, dim=1)
@@ -969,7 +1127,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
         # 5. Log the loss
         total_loss += loss.item()
-        postfix_dict["step_loss"] = loss.item()
+        postfix_dict["batch_loss"] = loss.item()
         # logging.info(f"Before clear cache")
         # print_gpu_info(handle0, 0)
         # print_gpu_info(handle1, 1)
@@ -981,13 +1139,17 @@ if __name__ == "__main__":
         # print_gpu_info(handle0, 0)
         # print_gpu_info(handle1, 1)
         avg_total_loss = total_loss / (step+1)
-        postfix_dict["avg_total_loss"] = avg_total_loss
+        postfix_dict["avg_total_loss"] = - avg_total_loss
+        if script_args.report_to == "wandb":
+            wandb.log(postfix_dict, step=step+1)
         pbar.set_postfix(postfix_dict)
         if (step+1) % (script_args.eval_steps * script_args.gradient_accumulation_steps) == 0:
             torch.cuda.empty_cache()
             all_val_gen_rewards, prefixes, fixed_prefixes, gen_suffixes = evaluate_on_validation(script_args, model, tokenizer, get_score, reward_batch_size)
             current_avg_reward = np.mean(all_val_gen_rewards)
             save_in_jsonl([{"step":(step+1), "avg_reward": current_avg_reward}], eval_trajectory_file, append=True)
+            if script_args.report_to == "wandb":
+                wandb.log({"avg_reward/val": current_avg_reward}, step=step+1)
             torch.cuda.empty_cache()
             if current_avg_reward > best_initial_avg_reward:
                 logging.info(f"Achieved new best average reward of {current_avg_reward:.4f} on validation set. Compared to previous best of {best_initial_avg_reward:.4f}")
