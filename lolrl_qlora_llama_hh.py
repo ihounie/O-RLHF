@@ -47,7 +47,7 @@ class ScriptArguments:
     adam_beta2: float = field(default=0.999, metadata={"help": 'The beta2 parameter for AdamW'})
     adam_epsilon: float = field(default=1e-6, metadata={"help": 'The epsilon parameter for AdamW'})
     weight_decay: float = field(default=0.0, metadata={"help": 'The L2 weight decay rate of AdamW'}) # use lora dropout instead for regularization if needed
-    learning_rate: float = field(default=0.0002, metadata={"help": 'The learnign rate'})
+    learning_rate: float = field(default=0.0001, metadata={"help": 'The learnign rate'})
     max_grad_norm: float = field(default=0.3, metadata={"help": 'Gradient clipping max norm. This is tuned and works well for all models tested.'})
     gradient_checkpointing: bool = field(default=True, metadata={"help": 'Use gradient checkpointing. You want to use this.'})
     lr_scheduler_type: str = field(default='constant', metadata={"help": 'Learning rate schedule. Constant a bit better than cosine, and has advantage for analysis'})
@@ -59,7 +59,7 @@ class ScriptArguments:
     # ['adamw_hf', 'adamw_torch', 'adamw_torch_fused', 'adamw_torch_xla', 'adamw_apex_fused', 'adafactor', 'adamw_bnb_8bit', 'adamw_anyprecision', 'sgd', 'adagrad']
     # Somebody suggested using adamw_bnb_8bit: https://gist.github.com/pacman100/1731b41f7a90a87b457e8c5415ff1c14?permalink_comment_id=4610607#gistcomment-4610607
 
-    per_device_eval_batch_size: Optional[int] = field(default=4, metadata={"help": "eval batch size per device"})
+    per_device_eval_batch_size: Optional[int] = field(default=32, metadata={"help": "eval batch size per device"})
 
     double_quant: bool = field(default=True, metadata={"help": "Compress the quantization statistics through double quantization."})
     quant_type: str = field(default="nf4", metadata={"help": "Quantization data type to use. Should be one of `fp4` or `nf4`."})
@@ -74,8 +74,8 @@ class ScriptArguments:
     logging_steps: Optional[int] = field(default=10, metadata={"help": "the logging frequency"})
     save_steps: Optional[int] = field(default=2500, metadata={"help": "the saving frequency"})
     # max_steps: Optional[int] = field(default=10000, metadata={"help": "max number of training steps"})
-    max_steps: Optional[int] = field(default=9000, metadata={"help": "max number of training steps"})
-    eval_steps: Optional[int] = field(default=200, metadata={"help": "the evaluation frequency"})
+    max_steps: Optional[int] = field(default=1000, metadata={"help": "max number of training steps"})
+    eval_steps: Optional[int] = field(default=50, metadata={"help": "the evaluation frequency"})
 
     output_dir: Optional[str] = field(default="./results", metadata={"help": "the output directory"})
     log_freq: Optional[int] = field(default=1, metadata={"help": "the logging frequency"})
@@ -120,13 +120,15 @@ class ScriptArguments:
     # a2c_n_value_head_epochs: Optional[int] = field(default=5, metadata={"help": "the number of epochs to train the value head for"})
     a2c_n_value_head_epochs: Optional[int] = field(default=10, metadata={"help": "the number of epochs to train the value head for"})
     algorithm: Optional[str] = field(default="ofopo", metadata={"help": "the algorithm to use for training choices=['nll', 'wbc', 'r_gold', 'r_lol', 'a_lol', 'a_lol_ref_free', 'a_lol_seq', 'a_lol_kl']"})
-    ppo_clip: Optional[float] = field(default=None, metadata={"help": "the clipping parameter for PPO"})
-    kl_beta: Optional[float] = field(default=0.1, metadata={"help": "the beta parameter for KL penalty"})
+    ppo_clip: Optional[float] = field(default=0.9, metadata={"help": "the clipping parameter for PPO"})
+    kl_beta: Optional[float] = field(default=0.005, metadata={"help": "the beta parameter for KL penalty"})
     sampling_strategy: Optional[str] = field(default=None, metadata={"help": "the sampling strategy to use for advantage LoL RL methods"})
     ofopo_dispreferred_ratio: Optional[float] = field(default=0.5, metadata={"help": "the ratio of dispreferred responses to sample"})
     ofopo_reward_sigmoid: Optional[bool] = field(default=False, metadata={"help": "whether to apply a sigmoid to the reward"})
     cache_dir: Optional[str] = field(default="cache/", metadata={"help": "the cache directory"})
     seed: Optional[int] = field(default=RANDOM_SEED, metadata={"help": "the random seed"})
+    tolerance: Optional[int] = field(default=10, metadata={"help": "the tolerance for early stopping on validation"})
+
 ######
 # (ihounie): pre computing the baseline full sequence log probs to speedup
 # and save some memory
@@ -444,6 +446,8 @@ if __name__ == "__main__":
     torch.manual_seed(script_args.seed)
     torch.cuda.manual_seed_all(script_args.seed)
     logging.info(f"Set all seeds to {script_args.seed}")
+
+    tolerance_counter = 0
 
     # Initialize W&B run
     if script_args.report_to == "wandb":
@@ -977,8 +981,7 @@ if __name__ == "__main__":
                 total_kl_penalty += kl_penalty.mean().cpu().detach().item()
                 r_loss = torch.FloatTensor(batch_rewards).to(model.device)
                 total_rlol_loss += r_loss.mean().cpu().detach().item()
-                loss = -((r_loss + kl_penalty) * importance_sampling_ratio).mean()
-                breakpoint()
+                loss = (-(r_loss + kl_penalty) * importance_sampling_ratio).mean()
                 ###################
                 # (ihounie): THAT's IT. SIMPLE, RIGHT?
                 #####################
@@ -988,7 +991,7 @@ if __name__ == "__main__":
                     wandb.log({"reward_IS/train/batch":(r_loss*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
                     wandb.log({"kl_penalty_IS/train/batch":(kl_penalty*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
                     wandb.log({"loss_wo_IS/train/batch":(r_loss + kl_penalty).mean().cpu().detach().item()}, step=step+1)
-                    wandb.log({"loss/train/batch":(-loss).cpu().detach().item()}, step=step+1)
+                    wandb.log({"loss/train/batch":(loss).cpu().detach().item()}, step=step+1)
                 postfix_dict["kl_penalty/train/avg"] = total_kl_penalty / (step+1)
                 postfix_dict["reward/train/avg"] = total_rlol_loss / (step+1)
             else:
@@ -1152,6 +1155,7 @@ if __name__ == "__main__":
                 wandb.log({"avg_reward/val": current_avg_reward}, step=step+1)
             torch.cuda.empty_cache()
             if current_avg_reward > best_initial_avg_reward:
+                tolerance_counter = 0
                 logging.info(f"Achieved new best average reward of {current_avg_reward:.4f} on validation set. Compared to previous best of {best_initial_avg_reward:.4f}")
                 best_initial_avg_reward = current_avg_reward
                 # Save the peft model
@@ -1161,6 +1165,11 @@ if __name__ == "__main__":
                 best_model = deepcopy(model).to("cpu")
             else:
                 logging.info(f"Average reward of {current_avg_reward:.4f} on validation set is not better than previous best of {best_initial_avg_reward:.4f}")
+                # increase tolerance counter
+                tolerance_counter += 1
+                if tolerance_counter > script_args.tolerance:
+                    logging.info(f"Tolerance counter {script_args.tolerance} exceeded. Terminating training")
+                    break
             model.train()
     if best_model is None:
         # Save the last checkpoint with warning
@@ -1169,6 +1178,3 @@ if __name__ == "__main__":
         logging.warning(f"Last checkpoint saved")
     else:
         logging.info(f"Best model already saved at {script_args.output_dir}")
-    breakpoint()
-    # To Hoard
-    breakpoint()

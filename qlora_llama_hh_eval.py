@@ -57,7 +57,7 @@ class ScriptArguments:
     # ['adamw_hf', 'adamw_torch', 'adamw_torch_fused', 'adamw_torch_xla', 'adamw_apex_fused', 'adafactor', 'adamw_bnb_8bit', 'adamw_anyprecision', 'sgd', 'adagrad']
     # Somebody suggested using adamw_bnb_8bit: https://gist.github.com/pacman100/1731b41f7a90a87b457e8c5415ff1c14?permalink_comment_id=4610607#gistcomment-4610607
 
-    per_device_eval_batch_size: Optional[int] = field(default=16, metadata={"help": "eval batch size per device"})
+    per_device_eval_batch_size: Optional[int] = field(default=32, metadata={"help": "eval batch size per device"})
 
     lora_alpha: Optional[float] = field(default=16, metadata={"help": "the lora alpha parameter"})
     double_quant: bool = field(default=True, metadata={"help": "Compress the quantization statistics through double quantization."})
@@ -224,7 +224,7 @@ if __name__ == "__main__":
     logging.info(f"Loading model from {script_args.model_name_or_path}")
     base_model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name_or_path,
-        load_in_4bit=True,
+        #load_in_4bit=True,
         torch_dtype=torch.float16,
         # torch_dtype=torch.bfloat16,
         device_map="auto",
