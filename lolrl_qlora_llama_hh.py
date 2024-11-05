@@ -10,7 +10,7 @@ from datasets import Dataset, load_dataset
 from peft import AutoPeftModelForCausalLM, LoraConfig, PeftModel
 from transformers import AutoTokenizer, HfArgumentParser, TrainingArguments, BitsAndBytesConfig, AutoModelForCausalLM, DataCollatorForLanguageModeling,LlamaTokenizer
 
-from trl import DPOTrainer, SFTTrainer
+#from trl import DPOTrainer, SFTTrainer
 from tqdm import tqdm
 import json
 from metrics_hh import create_reward_fn
@@ -24,6 +24,7 @@ from copy import deepcopy
 from collections import defaultdict, Counter
 from utils.utils import RANDOM_SEED, save_in_pickle, load_from_pickle, make_dir_if_not_exists, reduce_mean, save_in_jsonl, reduce_sum
 import random
+from torch.func import grad, functional_call, vmap
 
 from utils.rl_utils import ValueHeadMLP, ValueHeadAttention, numba_choice
 import wandb
@@ -149,6 +150,22 @@ def get_or_compute_log_probs(baseline_model, tokenizer, dataset, batch_size, dev
 
     return log_probs
 
+def get_or_compute_gradient_norms(baseline_model, tokenizer, dataset, device, cache_dir):
+    # Define the file path for storing log probabilities
+    gradient_file = os.path.join(cache_dir, "gradient_norms_cache.pkl")
+    
+    # Check if log probabilities have already been computed and saved
+    if os.path.exists(gradient_file):
+        logging.info(f"Loading precomputed gradient norms from {gradient_file}")
+        gradient_norms = load_from_pickle(gradient_file)
+        logging.info(f"Loaded precomputed gradient norms from disk")
+    else:
+        logging.info(f"Precomputed gradient norms not found. Computing gradient norms...")
+        gradient_norms = precompute_and_save_gradient_norms(baseline_model, tokenizer, dataset, device, gradient_file)
+        logging.info(f"Computed and saved gradient norms in {gradient_file}")
+
+    return gradient_norms
+
 def precompute_and_save_baseline_log_probs(baseline_model, tokenizer, dataset, batch_size, device, baseline_log_probs_file):
     baseline_full_seq_log_probs_list = []
     baseline_model.eval()
@@ -205,6 +222,79 @@ def precompute_and_save_baseline_log_probs(baseline_model, tokenizer, dataset, b
     logging.info(f"Saved baseline full sequence log probabilities in {baseline_log_probs_file}")
     
     return baseline_full_seq_log_probs_array
+def precompute_and_save_gradient_norms(baseline_model, tokenizer, dataset,device, gradient_norms_file):
+    baseline_full_grad_norms_list = []
+    baseline_model.eval()
+
+    for i in tqdm(range(0, len(dataset)), desc="Precomputing baseline full sequence prob gradient"):
+        batch = [dataset[i]]
+        batch_og_prefixes = [datum['prefix'][0] for datum in batch]
+        batch_prefixes = ["".join(prefix) for prefix in batch_og_prefixes]
+        prompt_prefix = "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n"
+        batch_prefixes_fixed = [prompt_prefix + prefix_str.replace("<|prompter|>", " ### Human: ").replace("<|assistant|>", " ### Assistant: ").strip() for prefix_str in batch_prefixes]
+        # 2.2 Get left truncated prefix input
+        tokenizer.truncation_side, tokenizer.padding_side = "left", "left"
+        current_batch_prefixes_inputs = tokenizer(batch_prefixes_fixed, max_length = 768 - 128,truncation = True,add_special_tokens=True, padding = True, return_tensors="pt").to(baseline_model.device)
+        batch_size, query_seq_len = current_batch_prefixes_inputs["input_ids"].shape
+        baseline_grad_norm_suffix_list = []
+        for suffix_index in [0, 1]:
+            batch_suffix_indices = [suffix_index] * len(batch)
+            # 2. Preprocess the batch data for model
+            # 2.1. Get the batch prefix and suffix
+        
+            batch_suffixes = [datum['suffix'][batch_suffix_indices[i]] for i, datum in enumerate(batch)]
+            
+            # 2.3 Get right truncated suffix input
+            # NOTE: Adding tokenizer_eos token to the end of the suffixes
+            batch_suffixes = [suffix + tokenizer.eos_token for suffix in batch_suffixes]
+            tokenizer.truncation_side, tokenizer.padding_side = "right", "right"
+            current_batch_suffixes_inputs = tokenizer(batch_suffixes, max_length = 128,truncation = True,add_special_tokens=False, padding = True, return_tensors="pt").to(baseline_model.device)
+            # Gather per label logits
+            labels = current_batch_suffixes_inputs["input_ids"]
+            response_mask = current_batch_suffixes_inputs["attention_mask"]
+            baseline_input_ids = torch.cat([current_batch_prefixes_inputs["input_ids"], current_batch_suffixes_inputs["input_ids"]], dim=1).to(baseline_model.device)
+            baseline_attention_mask = torch.cat([current_batch_prefixes_inputs["attention_mask"], current_batch_suffixes_inputs["attention_mask"]], dim=1).to(baseline_model.device)
+            baseline_outputs = baseline_model(baseline_input_ids, attention_mask=baseline_attention_mask)
+            batch_size, query_seq_len = current_batch_prefixes_inputs["input_ids"].shape
+            baseline_resp_logits = baseline_outputs.logits[:, (query_seq_len - 1):-1, :]
+            baseline_log_probs = F.log_softmax(baseline_resp_logits, dim=-1)
+            baseline_labels = labels.to(baseline_model.device)
+            baseline_per_token_log_probs = -torch.gather(baseline_log_probs, 2, baseline_labels[:, :, None]).squeeze(2)
+            baseline_response_mask = response_mask.to(baseline_model.device)
+            baseline_full_seq_log_probs = torch.sum(baseline_per_token_log_probs * baseline_response_mask, dim=1)
+            target_scale = 1.0  # exp(-1) ≈ 0.3679
+            scale_factor = (target_scale / baseline_full_seq_log_probs).detach()
+            # Compute gradient for single sequence
+            scaled_neg_log_prob = baseline_full_seq_log_probs * scale_factor
+            scaled_prob = torch.exp(-scaled_neg_log_prob)        
+            rescale = torch.exp((-scaled_neg_log_prob + scaled_neg_log_prob).detach().to(torch.float64))
+            baseline_model.zero_grad()
+            # Compute gradient for single sequence
+            scaled_prob.backward() 
+            # Collect all parameter gradients into a single vector
+            sample_grads = []
+            for p in baseline_model.parameters():
+                if p.grad is not None:
+                    sample_grads.append(p.grad.to('cuda:0').flatten())
+            
+            # Concatenate all gradients into a single vector
+            full_grad = torch.cat(sample_grads)
+            
+            # Compute the norm of the full gradient vector
+            grad_norm = torch.norm(full_grad)
+
+            baseline_grad_norm_suffix_list.append((rescale*grad_norm.to(torch.float64)).item())
+        baseline_grad_norms_np = np.array(baseline_grad_norm_suffix_list, dtype=np.float64)
+        # Append to list
+        baseline_full_grad_norms_list.append(baseline_grad_norms_np)
+    baseline_full_grad_norms_array = np.stack(baseline_full_grad_norms_list, axis=0)
+    # Save the full sequence log probabilities to a file
+    save_in_pickle(baseline_full_grad_norms_array , gradient_norms_file)
+    
+    logging.info(f"Saved baseline full sequence log probabilities in {gradient_norms_file}")
+    
+    return baseline_full_grad_norms_array
+
 def evaluate_on_validation(args, model, tokenizer, get_score, reward_batch_size):
     model.eval()
     
@@ -518,7 +608,7 @@ if __name__ == "__main__":
     all_good_suffixes_with_newline = [suffix for suffix in all_good_suffixes if "\n" in suffix]
     logging.info(f"Number of good suffixes with newline: {len(all_good_suffixes_with_newline)}")
 
-    if script_args.algorithm in ["r_lol", "a_lol", "a_lol_seq", "ofopo"]:
+    if script_args.algorithm in ["r_lol", "a_lol", "a_lol_seq", "ofopo", "suprema"]:
         print_gpu_info(handle0, 0)
         print_gpu_info(handle1, 1)
         # Sharing backbone between training and behavior policy is not permitted yet: https://github.com/huggingface/peft/issues/854
@@ -541,7 +631,7 @@ if __name__ == "__main__":
         print_gpu_info(handle1, 1)
         # Also initialize a behavior policy model
         logging.info(f"Initializing the behavior policy model from {script_args.adapter_path}")
-        baseline_model = PeftModel.from_pretrained(baseline_base_model, script_args.adapter_path, is_trainable=False)
+        baseline_model = PeftModel.from_pretrained(baseline_base_model, script_args.adapter_path, is_trainable=True)
         baseline_model.eval()
         print_trainable_parameters(baseline_model)
         print_gpu_info(handle0, 0)
@@ -552,6 +642,13 @@ if __name__ == "__main__":
             tokenizer,
             train_dataset,
             script_args.per_device_eval_batch_size,
+            baseline_model.device,
+            script_args.cache_dir
+        )
+        baseline_grad_norms = get_or_compute_gradient_norms(
+            baseline_model,
+            tokenizer,
+            train_dataset,
             baseline_model.device,
             script_args.cache_dir
         )
@@ -663,6 +760,10 @@ if __name__ == "__main__":
         current_train_indices = deepcopy(train_indices)
         random.shuffle(current_train_indices)
         sampler = iter(current_train_indices)
+    if script_args.algorithm=="suprema":
+        train_indices = list(range(len(train_dataset)))
+        
+        sample_probs = np.abs(all_rewards-script_args.kl_beta)*baseline_grad_norms
     elif script_args.algorithm in ["wbc", "r_gold", "r_lol"]:
         logging.info(f"Percentiles for all good rewards: {np.percentile(all_good_rewards, [0, 25, 50, 75, 100])}")
         logging.info(f"Percentiles for all bad rewards: {np.percentile(all_bad_rewards, [0, 25, 50, 75, 100])}")
@@ -764,10 +865,13 @@ if __name__ == "__main__":
     total_suffix_distribution = {0:0, 1:0}
     logging.info(f"Evaluating every {script_args.eval_steps * script_args.gradient_accumulation_steps} steps.")
     logging.info(f"Using algorithm: {script_args.algorithm}")
-    if script_args.algorithm in ["a_lol", "a_lol_seq", "a_lol_ref_free", "ofopo"]:
+    if script_args.algorithm in ["a_lol", "a_lol_seq", "a_lol_ref_free", "ofopo", "suprema"]:
         logging.info(f"Using PPO CLIP: {script_args.ppo_clip}")
         logging.info(f"Using KL beta: {script_args.kl_beta}")
     best_model = None
+    if script_args.algorithm in ["suprema"]:
+        prompt_response_indices = np.array([{"prompt": i, "suffix": j} for j in range(2) for i in range(len(train_indices))], dtype=object)
+        all_gradients = defaultdict(int)
     for step in pbar:
         # 1. Get the next batch of data from sampler
         if script_args.algorithm == "nll":
@@ -780,7 +884,7 @@ if __name__ == "__main__":
                 sampler = iter(current_train_indices)
                 batch_indices = [next(sampler) for _ in range(script_args.per_device_train_batch_size)]
             batch_suffix_indices = [0] * len(batch_indices)
-        elif script_args.algorithm == "ofopo":
+        elif script_args.algorithm in ["ofopo"]:
             try:
                 batch_indices = [next(sampler) for _ in range(script_args.per_device_train_batch_size)]
             except StopIteration:
@@ -795,7 +899,17 @@ if __name__ == "__main__":
             batch_suffix_indices[dispreferred_indexes] = 1
             batch_rewards = all_rewards[batch_indices, batch_suffix_indices]
             batch_bline_log_probs = baseline_log_probs[batch_indices, batch_suffix_indices]
+        elif script_args.algorithm in ["suprema"]:
+            sample_probs = sample_probs/sample_probs.sum()
             
+            all_indices = np.random.choice(prompt_response_indices, size=script_args.per_device_train_batch_size, p=sample_probs.flatten(), replace=False)
+            batch_indices, batch_suffix_indices = [], []
+            for idx in all_indices:
+                batch_indices.append(idx["prompt"])
+                batch_suffix_indices.append(idx["suffix"])
+            batch_suffix_indices = np.array(batch_suffix_indices)
+            batch_rewards = all_rewards[batch_indices, batch_suffix_indices]
+            batch_bline_log_probs = baseline_log_probs[batch_indices, batch_suffix_indices]
         elif script_args.algorithm in ["wbc", "r_gold", "r_lol"]:
             batch_indices = numba_choice(sample_indices, sample_probs_csum, 4).tolist()
             if script_args.sampling_strategy == "good_priority":
@@ -803,7 +917,7 @@ if __name__ == "__main__":
                 batch_suffix_indices = [0] * len(batch_indices)
             else:
                 logging.warning(f"Not implemented for sampling strategy {script_args.sampling_strategy}")
-                breakpoint()
+                
         elif script_args.algorithm in ["a_lol", "a_lol_seq", "a_lol_ref_free"]:
             if script_args.sampling_strategy is None:
                 # Use the same sampling as NLL
@@ -837,6 +951,7 @@ if __name__ == "__main__":
                     batch_indices = new_batch_indices
                     batch_rewards = np.array([all_good_rewards[idx] if idx < len(all_good_advantages) else all_bad_rewards[idx - len(all_good_advantages)] for idx in batch_indices])
                 assert np.all(batch_advantages >= 0.0), breakpoint()
+           
         batch = [train_dataset[i] for i in batch_indices]
         # 2. Preprocess the batch data for model
         # 2.1. Get the batch prefix and suffix
@@ -874,7 +989,20 @@ if __name__ == "__main__":
         # logits is of the shape [batch_size, seq_len, vocab_size]
         # labels is of the shape [batch_size, seq_len]
         resp_log_probs = F.log_softmax(resp_logits, dim=-1)
+        resp_probs = F.softmax(resp_logits, dim=-1)                               
         per_token_log_probs = -torch.gather(resp_log_probs, 2, labels[:, :, None]).squeeze(2)
+        
+        batch_size, seq_len, vocab_size = resp_probs.shape
+    
+        # Create index tensor to gather values
+        batch_idx = torch.arange(batch_size).unsqueeze(1).expand(-1, seq_len)  # [batch_size, seq_len]
+        seq_idx = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)    # [batch_size, seq_len]
+    
+        # Gather probabilities using advanced indexing
+        # This selects the probability for each label token at each sequence position
+        per_token_probs = resp_probs[batch_idx, seq_idx, labels] 
+        
+
         postfix_dict = dict()
         # Update the suffix distribution
         for suffix_idx in batch_suffix_indices:
@@ -944,7 +1072,7 @@ if __name__ == "__main__":
                     importance_sampling_ratio = importance_sampling_ratio_clamped
             total_reward += np.mean(batch_rewards)
             postfix_dict["avg_reward"] = total_reward / (step+1)
-        elif script_args.algorithm in ["ofopo"]:
+        elif script_args.algorithm in ["ofopo", "suprema"]:
             # Reward * Importance weight * log pi
             batch_bline_neg_log_probs_tensor = torch.tensor(batch_bline_log_probs).to(model.device)
                 # Compute the seq importance sampling ratio over each word
@@ -954,44 +1082,92 @@ if __name__ == "__main__":
             per_seq_neg_log_probs = torch.sum(per_token_log_probs * response_mask, dim=1)
             if script_args.report_to == "wandb":
                 wandb.log({"nll/train/batch":per_seq_neg_log_probs.mean().cpu().detach().item()}, step=step+1)
-            importance_sampling_ratio = torch.exp(batch_bline_neg_log_probs_tensor - per_seq_neg_log_probs)
-            if script_args.report_to == "wandb":
-                wandb.log({"importance_sampling_ratio/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
-            if script_args.ppo_clip is not None and script_args.ppo_clip > 0.0:
-                # Clamp the importance sampling ratio
-                importance_sampling_ratio_clamped = torch.clamp(importance_sampling_ratio, 1 - script_args.ppo_clip, 1 + script_args.ppo_clip)
-                # return_dict['importance_sampling_ratio_clamped'] = importance_sampling_ratio_clamped
-                importance_sampling_ratio = importance_sampling_ratio_clamped
+            if script_args.algorithm == "ofopo":
+                importance_sampling_ratio = torch.exp(batch_bline_neg_log_probs_tensor - per_seq_neg_log_probs)
                 if script_args.report_to == "wandb":
-                    wandb.log({"importance_sampling_ratio_clamped/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
-            #(ihounie) Just for logging
-            total_reward += np.mean(batch_rewards*importance_sampling_ratio.cpu().detach().numpy())
-            postfix_dict["IS_weighted_reward/train/avg"] = total_reward / (step+1)
+                    wandb.log({"importance_sampling_ratio/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
+                if script_args.ppo_clip is not None and script_args.ppo_clip > 0.0:
+                    # Clamp the importance sampling ratio
+                    importance_sampling_ratio_clamped = torch.clamp(importance_sampling_ratio, 1 - script_args.ppo_clip, 1 + script_args.ppo_clip)
+                    # return_dict['importance_sampling_ratio_clamped'] = importance_sampling_ratio_clamped
+                    importance_sampling_ratio = importance_sampling_ratio_clamped
+                    if script_args.report_to == "wandb":
+                        wandb.log({"importance_sampling_ratio_clamped/train/batch":importance_sampling_ratio.mean().cpu().detach().item()}, step=step+1)
+                #(ihounie) Just for logging
+                total_reward += np.mean(batch_rewards*importance_sampling_ratio.cpu().detach().numpy())
+
+                postfix_dict["IS_weighted_reward/train/avg"] = total_reward / (step+1)
             if script_args.kl_beta > 0.0:
                 # per_token_log_probs is negative log probs
                 ###################
                 # (ihounie): THIS IS OUR LOSS
                 #####################
                 # baseline_full_seq_log_probs is negative log probs
-                per_seq_neg_log_probs = torch.sum(per_token_log_probs * response_mask, dim=1)
                 # (ihounie): bear in mind that batch_bline_neg_log_probs_tensor and baseline_full_seq_log_probs are negative log probs
                 # so the line below is equivalent to 
                 # kl_penalty = - script_args.kl_beta * log(per_seq_probs/baseline_seq_probs).mean()
                 kl_penalty = script_args.kl_beta * ((per_seq_neg_log_probs-batch_bline_neg_log_probs_tensor))
                 total_kl_penalty += kl_penalty.mean().cpu().detach().item()
                 r_loss = torch.FloatTensor(batch_rewards).to(model.device)
-                total_rlol_loss += r_loss.mean().cpu().detach().item()
-                loss = (-(r_loss + kl_penalty) * importance_sampling_ratio).mean()
+                if script_args.algorithm == "ofopo":
+                    total_rlol_loss += r_loss.mean().cpu().detach().item()
+                    loss = (-(r_loss + kl_penalty) * importance_sampling_ratio).mean()
+                elif script_args.algorithm == "suprema":
+                    #probs = torch.exp(-per_seq_neg_log_probs)
+                    # Compute gradients with respect to model parameters for this sample
+                    with torch.no_grad():
+                        reward_grad = r_loss + kl_penalty-script_args.kl_beta
+                        reward_grad_abs = torch.abs(reward_grad)
+                        reward_signs = torch.sign(reward_grad)
+                    for i in range(len(reward_signs)):
+                        model.zero_grad()
+                        target_scale = 1.0  # exp(-1) ≈ 0.3679
+                        scale_factor = (target_scale / per_seq_neg_log_probs[i]).detach()
+                        # Compute gradient for single sequence
+                        scaled_neg_log_prob = per_seq_neg_log_probs[i] * scale_factor
+                        scaled_prob = torch.exp(-scaled_neg_log_prob)
+                        scaled_prob.backward(retain_graph=True)
+                        
+                        
+                        # Collect all parameter gradients into a single vector
+                        grad_norm = 0
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                
+                                #if torch.isnan(p.grad).any():
+                                    
+                                grad_norm += torch.norm(p.grad.flatten()).item()**2
+                        
+                        # Compute the norm of the full gradient vector
+                        #print("grad norm", grad_norm)
+                        
+                        grad_norm = np.sqrt(grad_norm)
+                        #print("grad norm", grad_norm)
+
+                        # TODO: update sampling weight more efficiently
+                        rescale = torch.exp((-per_seq_neg_log_probs[i] + scaled_neg_log_prob).detach().to(torch.float64))
+                        #print("rescale", rescale)
+                        
+                        with torch.no_grad():
+                            sample_probs[batch_indices[i], batch_suffix_indices[i]] = reward_grad_abs[i]*grad_norm*rescale
+
+                        # sum the gradients
+                        # TODO: MH-Step
+                        
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                all_gradients[p] += p.grad*reward_signs[i].to(p.grad.device)/min(grad_norm, 1e-4)
+                    
                 ###################
                 # (ihounie): THAT's IT. SIMPLE, RIGHT?
                 #####################
                 if script_args.report_to == "wandb":
                     wandb.log({"kl_penalty/train/batch":kl_penalty.mean().cpu().detach().item()}, step=step+1)
                     wandb.log({"reward/train/batch":r_loss.mean().cpu().detach().item()}, step=step+1)
-                    wandb.log({"reward_IS/train/batch":(r_loss*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
-                    wandb.log({"kl_penalty_IS/train/batch":(kl_penalty*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
+                    #wandb.log({"reward_IS/train/batch":(r_loss*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
+                    #wandb.log({"kl_penalty_IS/train/batch":(kl_penalty*importance_sampling_ratio).mean().cpu().detach().item()}, step=step+1)
                     wandb.log({"loss_wo_IS/train/batch":(r_loss + kl_penalty).mean().cpu().detach().item()}, step=step+1)
-                    wandb.log({"loss/train/batch":(loss).cpu().detach().item()}, step=step+1)
+                    #wandb.log({"loss/train/batch":(loss).cpu().detach().item()}, step=step+1)
                 postfix_dict["kl_penalty/train/avg"] = total_kl_penalty / (step+1)
                 postfix_dict["reward/train/avg"] = total_rlol_loss / (step+1)
             else:
@@ -1122,9 +1298,19 @@ if __name__ == "__main__":
             postfix_dict["avg_advantage"] = total_advantage / (step+1)
             loss = torch.mean(per_response_loss * torch.FloatTensor(batch_advantages).to(model.device))
         # 4. Backpropagate the loss and update the model parameters if gradient accumulation is done
-        loss.backward()
+           
+        if script_args.algorithm == "suprema":
+            loss = (r_loss + kl_penalty).mean().cpu().detach()
+            # Populate gradients
+            for p in model.parameters():
+                if p.requires_grad:
+                    p.grad = -all_gradients[p]/batch_size
+            all_gradients = defaultdict(int)     
+        else:
+            loss.backward()
+
         if (step+1) % script_args.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), script_args.max_grad_norm)
+            #torch.nn.utils.clip_grad_norm_(model.parameters(), script_args.max_grad_norm)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
